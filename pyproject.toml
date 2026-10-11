@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finsight-rag"
+version = "0.1.0"
+description = "Production-Grade Document Intelligence for Financial Workflows"
+readme = "README_AI_Engineer_1_FinSightRAG.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.28.0",
+    "pydantic>=2.6.0",
+    "python-multipart>=0.0.9",
+    "pdfplumber>=0.10.3",
+    "pypdf>=4.0.0",
+    "python-docx>=1.1.0",
+    "sentence-transformers>=2.5.1",
+    "tiktoken>=0.6.0",
+    "faiss-cpu>=1.8.0",
+    "rank-bm25>=0.2.2",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.5",
+    "httpx>=0.27.0"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
