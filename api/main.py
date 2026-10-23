@@ -172,8 +172,8 @@ def query_pipeline(req: QueryRequest):
             escalate=True,
         )
 
-    # 1. Hybrid search (BM25 + Dense with RRF)
-    results = retriever.search(req.query, top_k=req.top_k)
+    # 1. Hybrid search (BM25 + Dense with RRF + ColBERT late-interaction reranking)
+    results = retriever.search(req.query, top_k=req.top_k, enable_reranking=req.enable_reranking)
     context_chunks = [r.chunk for r in results]
 
     # 2. Generation & Guardrail

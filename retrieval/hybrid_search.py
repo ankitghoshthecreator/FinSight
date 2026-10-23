@@ -1,25 +1,40 @@
-"""Hybrid retrieval combining dense vector search and BM25 with Reciprocal Rank Fusion (RRF)."""
+"""Hybrid retrieval combining dense vector search and BM25 with Reciprocal Rank Fusion (RRF)
+and ColBERT late-interaction reranking.
+"""
 
 import math
 import re
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 from ingestion.models import DocumentChunk, SearchResult
 from retrieval.vector_store import VectorStore
 from retrieval.embedder import Embedder
+from retrieval.reranker import ColBERTReranker
+from retrieval.query_rewriter import FinancialQueryRewriter
 
 
 class HybridRetriever:
-    """Executes dense vector search and sparse BM25 keyword search, combining scores with RRF.
+    """Executes dense vector search and sparse BM25 keyword search, combining scores with RRF
+    and applying fine-grained ColBERT late-interaction reranking.
     
     Critical for financial documents where exact regulatory terms (e.g. 'Regulation T',
     'Tier 1 Capital Ratio', 'ISDA Schedule') must be matched precisely alongside semantic queries.
     """
 
-    def __init__(self, vector_store: VectorStore, embedder: Embedder, bm25_weight: float = 0.5, dense_weight: float = 0.5):
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        embedder: Embedder,
+        bm25_weight: float = 0.5,
+        dense_weight: float = 0.5,
+        reranker: Optional[ColBERTReranker] = None,
+        query_rewriter: Optional[FinancialQueryRewriter] = None,
+    ):
         self.vector_store = vector_store
         self.embedder = embedder
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
+        self.reranker = reranker if reranker is not None else ColBERTReranker()
+        self.query_rewriter = query_rewriter if query_rewriter is not None else FinancialQueryRewriter()
         self._bm25_corpus: List[List[str]] = []
         self._bm25_model = None
         self._rebuild_bm25()
@@ -46,7 +61,7 @@ class HybridRetriever:
         """Notify retriever that new documents were added to the vector store."""
         self._rebuild_bm25()
 
-    def _custom_bm25_search(self, tokenized_query: List[str], top_k: int) -> List[Dict[str, float]]:
+    def _custom_bm25_search(self, tokenized_query: List[str], top_k: int) -> List[tuple[int, float]]:
         """Lightweight BM25 implementation if rank_bm25 is not present."""
         N = len(self._bm25_corpus)
         if N == 0:
@@ -84,25 +99,41 @@ class HybridRetriever:
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]
 
-    def search(self, query: str, top_k: int = 5, rrf_k: int = 60) -> List[SearchResult]:
-        """Hybrid search with Reciprocal Rank Fusion (RRF) and min-max score normalization."""
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        rrf_k: int = 60,
+        enable_reranking: bool = True,
+        enable_query_rewrite: bool = True,
+    ) -> List[SearchResult]:
+        """Hybrid search with Reciprocal Rank Fusion (RRF), optional query rewriting,
+        and ColBERT late-interaction reranking.
+        """
         if self.vector_store.count() == 0:
             return []
 
+        # 0. Query Rewriting and Acronym Expansion
+        search_query = query
+        if enable_query_rewrite and self.query_rewriter:
+            search_query = self.query_rewriter.rewrite(query)
+
+        candidate_pool_size = top_k * 3 if enable_reranking else top_k * 2
+
         # 1. Dense retrieval
-        query_emb = self.embedder.embed_query(query)
-        dense_results = self.vector_store.search(query_emb, top_k=top_k * 2)
+        query_emb = self.embedder.embed_query(search_query)
+        dense_results = self.vector_store.search(query_emb, top_k=candidate_pool_size)
 
         # 2. BM25 retrieval
-        tokenized_query = self._tokenize(query)
+        tokenized_query = self._tokenize(search_query)
         bm25_scores = []
 
         if self._bm25_model is not None and tokenized_query:
             raw_scores = self._bm25_model.get_scores(tokenized_query)
-            ranked_indices = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)[:top_k * 2]
+            ranked_indices = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)[:candidate_pool_size]
             bm25_results = [(self.vector_store.chunks[i], float(raw_scores[i])) for i in ranked_indices]
         else:
-            raw_ranked = self._custom_bm25_search(tokenized_query, top_k=top_k * 2)
+            raw_ranked = self._custom_bm25_search(tokenized_query, top_k=candidate_pool_size)
             bm25_results = [(self.vector_store.chunks[i], score) for i, score in raw_ranked]
 
         # 3. Reciprocal Rank Fusion (RRF)
@@ -158,4 +189,11 @@ class HybridRetriever:
             )
 
         fused_list.sort(key=lambda x: x.score, reverse=True)
+
+        # 4. Optional ColBERT Late-Interaction Reranking
+        if enable_reranking and self.reranker:
+            candidates_to_rerank = fused_list[:top_k * 2]
+            reranked = self.reranker.rerank(query, candidates_to_rerank, top_k=top_k)
+            return reranked
+
         return fused_list[:top_k]

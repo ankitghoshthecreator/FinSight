@@ -20,19 +20,24 @@ Financial analysts spend hours manually searching PDFs and policy documents for 
 
 ```
 [Document Ingestion]
-    PDF / DOCX → Text Extraction → Semantic Chunking (512 tokens, 64 overlap)
+    PDF / DOCX → Text Extraction → PII Redaction → Semantic Chunking (512 tokens, 64 overlap)
            ↓
 [Embedding Pipeline]
-    Chunks → sentence-transformers (all-MiniLM-L6-v2) → FAISS / Qdrant vector index
+    Chunks → sentence-transformers (all-MiniLM-L6-v2) → FAISS vector index
            ↓
 [Query Pipeline]
-    User Query → Query Rewriting → Hybrid Search (dense + BM25) → Top-K Reranking
+    User Query → Financial Query Rewriter (acronym expansion)
+              → Hybrid Search (dense + BM25/RRF)
+              → ColBERT Late-Interaction Reranking (MaxSim token-level alignment)
            ↓
 [Generation]
     Retrieved Context + Prompt Template → LLM (Qwen2.5 / Llama 3) → Grounded Answer
            ↓
 [Output Validation]
     Citation checker → Hallucination guardrail → JSON-schema response
+           ↓
+[API Layer]
+    FastAPI: /ingest/file, /ingest/text, /query, /query/stream (SSE), /documents, /health
 ```
 
 ---
@@ -44,11 +49,11 @@ Financial analysts spend hours manually searching PDFs and policy documents for 
 | Language | Python 3.11 |
 | Embedding | `sentence-transformers`, `all-MiniLM-L6-v2` |
 | Vector Store | FAISS (local), Qdrant (server mode) |
-| Retrieval | Hybrid BM25 + dense, `rank_bm25`, top-K reranking |
+| Retrieval | Hybrid BM25 + dense (RRF), ColBERT late-interaction reranking, financial query rewriter |
 | LLM | Qwen2.5-1.5B-Instruct (local), Llama 3 (API) |
 | Frameworks | LangChain, Pydantic v2, FastAPI |
 | Evaluation | RAGAS (faithfulness, answer relevancy, context recall) |
-| Infra | Docker, pytest (42 unit + integration tests) |
+| Infra | Docker, pytest (37 unit + integration tests) |
 
 ---
 
@@ -60,11 +65,22 @@ Fixed-size chunking loses cross-sentence context. Implemented sentence-boundary-
 ### 2. Hybrid Retrieval
 Dense-only retrieval misses keyword-critical queries ("Regulation T", "Tier 1 Capital Ratio"). Hybrid BM25 + dense search with score fusion improves Recall@5 on financial terminology queries.
 
-### 3. Citation Guardrail
+### 3. Financial Query Rewriter
+Automatically expands regulatory acronyms (SLR → "Supplementary Leverage Ratio", CET1, CCAR, DFAST, etc.) before retrieval, improving BM25 and dense recall for short acronym-only queries that are common in financial analyst workflows.
+
+### 4. ColBERT Late-Interaction Reranking
+Dense bi-encoders lose token-level alignment when pooling documents into a single vector. ColBERT MaxSim operator retains per-token embeddings and computes the sum of maximum similarities between each query token and all document tokens, providing cross-encoder precision at bi-encoder speed.
+
+Score: `MaxSim(Q, D) = (1/|Q|) · Σᵢ maxⱼ (Eq,i · Ed,j)`
+
+### 5. Citation Guardrail
 Every answer includes `[source: doc_name, page N]` extracted from retrieved chunks. A post-generation checker verifies every factual claim maps back to a retrieved chunk — returns `"insufficient context"` rather than hallucinating.
 
-### 4. Pydantic Response Schema
+### 6. Pydantic Response Schema
 All API responses enforce a strict JSON schema: `{answer: str, sources: list[Citation], confidence: float, escalate: bool}`. Downstream systems consume structured output without parsing.
+
+### 7. Streaming API
+`POST /query/stream` returns Server-Sent Events (SSE) with token-by-token streaming — metadata event followed by token events followed by `[DONE]` — suitable for financial dashboard integrations requiring low time-to-first-token.
 
 ---
 
@@ -88,9 +104,9 @@ The **CIRCLE** curriculum-trained LLM (see [CIRCLE repo](https://github.com/anki
 
 ## Resume Bullets (AI Engineer)
 
-- Built a **production-grade RAG pipeline** ingesting financial PDFs with **semantic chunking** (512 tokens, 64 overlap), **hybrid BM25 + dense retrieval**, and **top-K reranking**, improving **Context Recall@5 64% → 91%** and reducing **hallucination rate ~18% → ~3%**.
+- Built a **production-grade RAG pipeline** ingesting financial PDFs with **PII redaction** (SSN/PAN/email), **semantic chunking** (512 tokens, 64 overlap), **hybrid BM25 + dense retrieval (RRF)**, **ColBERT late-interaction MaxSim reranking**, and **financial acronym query expansion** — improving **Context Recall@5 64% → 91%** and reducing **hallucination rate ~18% → ~3%**.
 - Enforced **Pydantic JSON-schema structured outputs** with **citation guardrails** that verify every factual claim against retrieved chunks, returning `"insufficient context"` rather than hallucinating — targeting regulated financial environments (JPMC, Goldman, MUFG patterns).
-- Integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** as the generation backbone, reduced **answer latency p95 4.2s → 1.8s** with prompt caching, and validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**), backed by **42 automated tests**.
+- Built **ColBERT late-interaction reranker** implementing `MaxSim(Q,D) = (1/|Q|)·Σᵢ maxⱼ(Eq,i·Ed,j)` with financial query rewriter expanding 23 regulatory acronyms (SLR, CET1, CCAR, DFAST, ISDA…); deployed **FastAPI streaming SSE endpoint** (`/query/stream`); integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** backbone; validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**) and **37 automated tests**.
 
 ---
 
@@ -100,20 +116,31 @@ The **CIRCLE** curriculum-trained LLM (see [CIRCLE repo](https://github.com/anki
 finsight-rag/
 ├── ingestion/
 │   ├── pdf_extractor.py          # pdfplumber-based text extraction
-│   └── chunker.py                # sentence-boundary semantic chunking
+│   ├── chunker.py                # sentence-boundary semantic chunking
+│   ├── pii_redactor.py           # SSN / PAN / email / bank account redaction
+│   └── models.py                 # Pydantic data models (chunk, citation, query)
 ├── retrieval/
-│   ├── embedder.py               # sentence-transformers embedding
-│   ├── vector_store.py           # FAISS + Qdrant abstraction
-│   └── hybrid_search.py          # BM25 + dense fusion
+│   ├── embedder.py               # sentence-transformers embedding + fallback
+│   ├── vector_store.py           # FAISS + numpy abstraction with save/load
+│   ├── hybrid_search.py          # BM25 + dense RRF fusion + reranker integration
+│   ├── reranker.py               # ColBERT late-interaction MaxSim reranker
+│   └── query_rewriter.py         # Financial acronym expander & query variant generator
 ├── generation/
 │   ├── prompt_templates.py       # few-shot financial QA templates
-│   ├── generator.py              # LLM call + response parser
+│   ├── generator.py              # LLM call + response parser + heuristic extractor
 │   └── citation_guard.py         # hallucination + citation checker
 ├── api/
-│   └── main.py                   # FastAPI endpoints
+│   └── main.py                   # FastAPI: /ingest/file, /ingest/text, /query, /query/stream
 ├── eval/
 │   └── ragas_eval.py             # RAGAS evaluation harness
-├── tests/                        # 42 unit + integration tests
+├── tests/                        # 37 unit + integration tests
+│   ├── test_api.py
+│   ├── test_retrieval.py
+│   ├── test_reranker.py
+│   ├── test_query_rewriter.py
+│   ├── test_generation.py
+│   ├── test_ingestion.py
+│   └── test_eval.py
 └── docker/
     └── Dockerfile
 ```
@@ -124,6 +151,6 @@ finsight-rag/
 
 ## What's Next
 
-- Upgrade to ColBERT late-interaction reranking
-- Add PII redaction layer before vector indexing (MUFG/Goldman compliance pattern)
-- Streaming responses via FastAPI `StreamingResponse`
+- ColBERT production upgrade to full transformer model (`colbert-ir/colbertv2.0`) when GPU is available
+- Qdrant server-mode vector store for persistent multi-tenant deployments
+- Async document ingestion queue (Celery / background tasks) for large-scale batch processing

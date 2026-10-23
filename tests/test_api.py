@@ -94,3 +94,25 @@ def test_api_streaming_query():
     assert "event: token" in body
     assert "[DONE]" in body
 
+
+def test_api_query_with_reranking_toggle():
+    # Test query with ColBERT late-interaction reranking enabled vs disabled
+    payload_rerank = {
+        "query": "Goldman Sachs Supplementary Leverage Ratio SLR",
+        "top_k": 2,
+        "enable_reranking": True
+    }
+    res_rerank = client.post("/query", json=payload_rerank)
+    assert res_rerank.status_code == 200
+    assert res_rerank.json()["confidence"] > 0.5
+
+    payload_no_rerank = {
+        "query": "Goldman Sachs Supplementary Leverage Ratio SLR",
+        "top_k": 2,
+        "enable_reranking": False
+    }
+    res_no_rerank = client.post("/query", json=payload_no_rerank)
+    assert res_no_rerank.status_code == 200
+    assert res_no_rerank.json()["confidence"] > 0.5
+
+
