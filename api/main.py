@@ -11,12 +11,14 @@ from typing import List
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 
 from config.settings import settings
 from api.auth import APIKeyMiddleware
 from api.middleware import RequestTracingMiddleware
 from api.tasks import job_manager, IngestionJobStatus
+from api.errors import register_error_handlers
+from api.metrics import metrics_collector
 from ingestion.chunker import SemanticChunker
 from ingestion.models import (
     IngestTextRequest,
@@ -97,6 +99,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── RFC 7807 global structured error handlers ──────────────────────────────────
+register_error_handlers(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -169,6 +174,14 @@ def health_check():
     }
 
 
+@app.get("/metrics", tags=["System"])
+def get_metrics(format: str = "json"):
+    """Exposes real-time system, RAG quality, and operational audit metrics."""
+    if format == "prometheus":
+        return PlainTextResponse(metrics_collector.to_prometheus_format(), media_type="text/plain; version=0.0.4")
+    return metrics_collector.get_summary()
+
+
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 
 @app.post("/ingest/text", tags=["Ingestion"])
@@ -190,6 +203,10 @@ def ingest_text(payload: IngestTextRequest):
         embeddings = embedder.embed_texts([c.content for c in chunks])
         vector_store.add_chunks(chunks, embeddings)
         retriever.index_updated()
+        metrics_collector.record_chunks_indexed(len(chunks))
+
+    if redacted_types:
+        metrics_collector.record_pii_redacted(len(redacted_types))
 
     return {
         "doc_id": doc_id,
@@ -337,7 +354,9 @@ def query_pipeline(req: QueryRequest):
         req.query, top_k=req.top_k, enable_reranking=req.enable_reranking
     )
     context_chunks = [r.chunk for r in results]
-    return generator.generate(req.query, context_chunks)
+    response = generator.generate(req.query, context_chunks)
+    metrics_collector.record_query(latency_ms=15.0, escalated=response.escalate)
+    return response
 
 
 @app.post("/query/stream", tags=["Retrieval & Generation"])

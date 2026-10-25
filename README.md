@@ -53,7 +53,7 @@ Financial analysts spend hours manually searching PDFs and policy documents for 
 | LLM | Qwen2.5-1.5B-Instruct (local), Llama 3 (API) |
 | Frameworks | LangChain, Pydantic v2, FastAPI |
 | Evaluation | RAGAS (faithfulness, answer relevancy, context recall) |
-| Infra | Docker, pytest (37 unit + integration tests) |
+| Infra | Docker, Docker Compose, GitHub Actions CI/CD, pytest (57 unit + integration tests) |
 
 ---
 
@@ -106,7 +106,8 @@ The **CIRCLE** curriculum-trained LLM (see [CIRCLE repo](https://github.com/anki
 
 - Built a **production-grade RAG pipeline** ingesting financial PDFs with **PII redaction** (SSN/PAN/email), **semantic chunking** (512 tokens, 64 overlap), **hybrid BM25 + dense retrieval (RRF)**, **ColBERT late-interaction MaxSim reranking**, and **financial acronym query expansion** — improving **Context Recall@5 64% → 91%** and reducing **hallucination rate ~18% → ~3%**.
 - Enforced **Pydantic JSON-schema structured outputs** with **citation guardrails** that verify every factual claim against retrieved chunks, returning `"insufficient context"` rather than hallucinating — targeting regulated financial environments (JPMC, Goldman, MUFG patterns).
-- Built **ColBERT late-interaction reranker** implementing `MaxSim(Q,D) = (1/|Q|)·Σᵢ maxⱼ(Eq,i·Ed,j)` with financial query rewriter expanding 23 regulatory acronyms (SLR, CET1, CCAR, DFAST, ISDA…); deployed **FastAPI streaming SSE endpoint** (`/query/stream`); integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** backbone; validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**) and **37 automated tests**.
+- Built **ColBERT late-interaction reranker** implementing `MaxSim(Q,D) = (1/|Q|)·Σᵢ maxⱼ(Eq,i·Ed,j)` with financial query rewriter expanding 23 regulatory acronyms (SLR, CET1, CCAR, DFAST, ISDA…); deployed **FastAPI streaming SSE endpoint** (`/query/stream`); integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** backbone; validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**) and **57 automated tests**.
+- Productionized with **pydantic-settings centralized config**, **persistent FAISS vector storage**, **API key auth + slowapi rate limiting**, **RFC 7807 problem details**, **Prometheus observability metrics**, and an **interactive Streamlit intelligence dashboard**, packaged via **Docker Compose** and validated with **GitHub Actions CI/CD**.
 
 ---
 
@@ -114,6 +115,9 @@ The **CIRCLE** curriculum-trained LLM (see [CIRCLE repo](https://github.com/anki
 
 ```
 finsight-rag/
+├── config/
+│   ├── settings.py               # pydantic-settings centralized configuration
+│   └── __init__.py
 ├── ingestion/
 │   ├── pdf_extractor.py          # pdfplumber-based text extraction
 │   ├── chunker.py                # sentence-boundary semantic chunking
@@ -121,7 +125,7 @@ finsight-rag/
 │   └── models.py                 # Pydantic data models (chunk, citation, query)
 ├── retrieval/
 │   ├── embedder.py               # sentence-transformers embedding + fallback
-│   ├── vector_store.py           # FAISS + numpy abstraction with save/load
+│   ├── vector_store.py           # FAISS persistent index + delete/reset methods
 │   ├── hybrid_search.py          # BM25 + dense RRF fusion + reranker integration
 │   ├── reranker.py               # ColBERT late-interaction MaxSim reranker
 │   └── query_rewriter.py         # Financial acronym expander & query variant generator
@@ -130,19 +134,36 @@ finsight-rag/
 │   ├── generator.py              # LLM call + response parser + heuristic extractor
 │   └── citation_guard.py         # hallucination + citation checker
 ├── api/
-│   └── main.py                   # FastAPI: /ingest/file, /ingest/text, /query, /query/stream
+│   ├── main.py                   # FastAPI application + endpoints
+│   ├── auth.py                   # API Key middleware with public exemptions
+│   ├── middleware.py             # Request tracing (UUID4) & latency audit logging
+│   ├── tasks.py                  # Background job manager for async document ingestion
+│   ├── errors.py                 # RFC 7807 problem details global error handlers
+│   └── metrics.py                # Prometheus & JSON observability metrics collector
+├── ui/
+│   └── app.py                    # Streamlit interactive financial intelligence dashboard
+├── data/
+│   └── samples/                  # Pre-loaded SEC filings (Goldman Sachs, JPMC)
 ├── eval/
 │   └── ragas_eval.py             # RAGAS evaluation harness
-├── tests/                        # 37 unit + integration tests
+├── tests/                        # 57 unit + integration tests
 │   ├── test_api.py
+│   ├── test_auth.py
+│   ├── test_config.py
+│   ├── test_persistence.py
+│   ├── test_observability.py
 │   ├── test_retrieval.py
 │   ├── test_reranker.py
 │   ├── test_query_rewriter.py
 │   ├── test_generation.py
 │   ├── test_ingestion.py
 │   └── test_eval.py
-└── docker/
-    └── Dockerfile
+├── docker/
+│   └── Dockerfile
+├── .github/
+│   └── workflows/ci.yml          # GitHub Actions automated test & Docker CI pipeline
+├── docker-compose.yml            # Multi-service stack (FinSight API + Qdrant)
+└── .env.example                  # Environment configuration template
 ```
 
 ---

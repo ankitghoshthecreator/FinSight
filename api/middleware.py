@@ -8,6 +8,7 @@ import logging
 from typing import Callable
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from api.metrics import metrics_collector
 
 logger = logging.getLogger("finsight.audit")
 
@@ -32,6 +33,7 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
 
         # Structured audit log
         client_host = request.client.host if request.client else "unknown"
+        metrics_collector.record_request(request.url.path, response.status_code, latency_ms)
         logger.info(
             f"request_id={request_id} method={request.method} path={request.url.path} "
             f"status={response.status_code} latency_ms={latency_ms} client_ip={client_host}"

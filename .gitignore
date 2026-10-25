@@ -47,7 +47,8 @@ Thumbs.db
 htmlcov/
 
 # Local Vector stores & indices
-data/
+data/*
+!data/samples/
 storage/
 faiss_index/
 qdrant_storage/

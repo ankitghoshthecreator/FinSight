@@ -25,7 +25,7 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 # Endpoints that bypass API key authentication
-_PUBLIC_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+_PUBLIC_PATHS = {"/", "/health", "/metrics", "/docs", "/openapi.json", "/redoc"}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):

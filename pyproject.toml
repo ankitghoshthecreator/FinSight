@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "finsight-rag"
 version = "0.1.0"
 description = "Production-Grade Document Intelligence for Financial Workflows"
-readme = "README_AI_Engineer_1_FinSightRAG.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110.0",
@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.6.0",
     "pydantic-settings>=2.3.0",
     "python-multipart>=0.0.9",
+    "slowapi>=0.1.9",
     "pdfplumber>=0.10.3",
     "pypdf>=4.0.0",
     "python-docx>=1.1.0",
