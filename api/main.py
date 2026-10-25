@@ -5,15 +5,18 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from typing import List
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from config.settings import settings
 from api.auth import APIKeyMiddleware
+from api.middleware import RequestTracingMiddleware
+from api.tasks import job_manager, IngestionJobStatus
 from ingestion.chunker import SemanticChunker
 from ingestion.models import (
     IngestTextRequest,
@@ -117,6 +120,9 @@ if settings.rate_limit_per_minute > 0:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
 
+# ── Request tracing & audit logging middleware ──────────────────────────────
+app.add_middleware(RequestTracingMiddleware)
+
 # ── API Key auth middleware ───────────────────────────────────────────────────
 app.add_middleware(APIKeyMiddleware)
 
@@ -135,6 +141,8 @@ def root():
         "health_check": "/health",
         "endpoints": {
             "ingest_file": "POST /ingest/file",
+            "ingest_file_async": "POST /ingest/file/async",
+            "ingest_status": "GET /ingest/status/{job_id}",
             "ingest_text": "POST /ingest/text",
             "query": "POST /query",
             "query_stream": "POST /query/stream",
@@ -231,6 +239,82 @@ async def ingest_file(file: UploadFile = File(...)):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _process_file_background(job_id: str, tmp_path: str, filename: str, file_ext: str):
+    """Worker task executed in background for large document files."""
+    try:
+        job_manager.update_job(job_id, status="processing")
+        if file_ext == ".pdf":
+            pages = extractor.extract(tmp_path)
+            doc_id = extractor.compute_doc_id(tmp_path)
+        else:
+            pages = extractor.extract_text_file(tmp_path)
+            doc_id = f"doc_{abs(hash(filename)) % 1_000_000:06d}"
+
+        chunks = chunker.chunk_document(pages, doc_id=doc_id, filename=filename)
+        if chunks:
+            embeddings = embedder.embed_texts([c.content for c in chunks])
+            vector_store.add_chunks(chunks, embeddings)
+            retriever.index_updated()
+
+        job_manager.update_job(
+            job_id,
+            status="completed",
+            doc_id=doc_id,
+            pages_parsed=len(pages),
+            chunks_created=len(chunks),
+            completed_at=time.time(),
+        )
+    except Exception as exc:
+        logger.error(f"Async ingestion job {job_id} failed: {exc}")
+        job_manager.update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            completed_at=time.time(),
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@app.post("/ingest/file/async", tags=["Ingestion"])
+async def ingest_file_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """Asynchronously ingests and chunks an uploaded document using background execution."""
+    allowed_exts = [".pdf", ".txt", ".md", ".docx"]
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{file_ext}'. Supported: {allowed_exts}",
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    job_id = job_manager.create_job(file.filename)
+    background_tasks.add_task(_process_file_background, job_id, tmp_path, file.filename, file_ext)
+
+    return {
+        "job_id": job_id,
+        "filename": file.filename,
+        "status": "queued",
+        "check_status_url": f"/ingest/status/{job_id}",
+    }
+
+
+@app.get("/ingest/status/{job_id}", response_model=IngestionJobStatus, tags=["Ingestion"])
+def get_ingest_job_status(job_id: str):
+    """Polls status of an asynchronous document ingestion job."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return job
 
 
 # ── Retrieval & Generation ────────────────────────────────────────────────────

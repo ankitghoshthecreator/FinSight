@@ -156,3 +156,39 @@ def test_api_delete_document_and_reset():
     reset_res = client.delete("/documents")
     assert reset_res.status_code == 200
     assert reset_res.json()["total_store_chunks"] == 0
+
+
+def test_api_request_tracing_headers():
+    res = client.get("/health")
+    assert res.status_code == 200
+    assert "x-request-id" in res.headers
+    assert "x-response-time-ms" in res.headers
+
+    # Custom request ID preserved
+    custom_id = "trace-req-abc-123"
+    res_custom = client.get("/health", headers={"X-Request-ID": custom_id})
+    assert res_custom.status_code == 200
+    assert res_custom.headers["x-request-id"] == custom_id
+
+
+def test_api_async_file_ingestion_and_status():
+    file_content = b"UBS Wealth Management Americas reported Q4 pre-tax profit of $450M."
+    files = {"file": ("UBS_Q4_Report.txt", file_content, "text/plain")}
+    res = client.post("/ingest/file/async", files=files)
+    assert res.status_code == 200
+    data = res.json()
+    assert "job_id" in data
+    assert data["status"] in ("queued", "processing", "completed")
+
+    job_id = data["job_id"]
+    status_res = client.get(f"/ingest/status/{job_id}")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["job_id"] == job_id
+    assert status_data["filename"] == "UBS_Q4_Report.txt"
+
+
+def test_api_async_job_not_found():
+    res = client.get("/ingest/status/job_nonexistent_999")
+    assert res.status_code == 404
+
