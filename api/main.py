@@ -7,6 +7,7 @@ from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
+from config.settings import settings
 from ingestion.models import (
     QueryRequest,
     QueryResponse,
@@ -25,34 +26,46 @@ from generation.generator import FinancialAnswerGenerator
 
 
 app = FastAPI(
-    title="FinSight RAG API",
+    title=settings.app_name,
     description="Production-Grade Document Intelligence for Financial Workflows (JPMC, Goldman, UBS)",
-    version="1.0.0",
+    version=settings.app_version,
+    debug=settings.debug,
 )
 
-# CORS middleware for integration with frontends & dashboards
+# CORS middleware — origins controlled via settings / .env
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pipeline instances (singleton lifecycle)
+# Pipeline instances (singleton lifecycle) — parameters from settings
 extractor = PDFExtractor()
-chunker = SemanticChunker(max_tokens=512, overlap_tokens=64)
-embedder = Embedder()
+chunker = SemanticChunker(
+    max_tokens=settings.chunk_max_tokens,
+    overlap_tokens=settings.chunk_overlap_tokens,
+)
+embedder = Embedder(
+    model_name=settings.embedding_model,
+    dimension=settings.embedding_dim,
+)
 vector_store = VectorStore(dimension=embedder.dimension)
-retriever = HybridRetriever(vector_store, embedder)
-generator = FinancialAnswerGenerator()
+retriever = HybridRetriever(
+    vector_store,
+    embedder,
+    bm25_weight=settings.bm25_weight,
+    dense_weight=settings.dense_weight,
+)
+generator = FinancialAnswerGenerator(model_name=settings.llm_model)
 
 
 @app.get("/", tags=["System"])
 def root():
     """Welcome endpoint with interactive documentation links and API summary."""
     return {
-        "service": "FinSight RAG API",
+        "service": settings.app_name,
         "status": "online",
         "documentation": "/docs",
         "openapi_schema": "/openapi.json",
