@@ -1,38 +1,99 @@
 """FastAPI application for FinSight RAG enterprise document intelligence."""
 
+import asyncio
+import logging
 import os
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from config.settings import settings
+from api.auth import APIKeyMiddleware
+from ingestion.chunker import SemanticChunker
 from ingestion.models import (
+    IngestTextRequest,
     QueryRequest,
     QueryResponse,
-    DocumentChunk,
-    DocumentMetadata,
-    IngestTextRequest,
 )
+from ingestion.pdf_extractor import ExtractedPage, PDFExtractor
 from ingestion.pii_redactor import PIIRedactor
-from ingestion.pdf_extractor import PDFExtractor
-
-from ingestion.chunker import SemanticChunker
 from retrieval.embedder import Embedder
-from retrieval.vector_store import VectorStore
 from retrieval.hybrid_search import HybridRetriever
+from retrieval.vector_store import VectorStore
 from generation.generator import FinancialAnswerGenerator
 
+logger = logging.getLogger(__name__)
+
+# ── Pipeline singletons ───────────────────────────────────────────────────────
+
+extractor = PDFExtractor()
+chunker   = SemanticChunker(
+    max_tokens=settings.chunk_max_tokens,
+    overlap_tokens=settings.chunk_overlap_tokens,
+)
+embedder = Embedder(
+    model_name=settings.embedding_model,
+    dimension=settings.embedding_dim,
+)
+vector_store = VectorStore(
+    dimension=embedder.dimension,
+    persist_dir=settings.faiss_persist_dir,   # auto-loads on init if dir exists
+)
+retriever = HybridRetriever(
+    vector_store,
+    embedder,
+    bm25_weight=settings.bm25_weight,
+    dense_weight=settings.dense_weight,
+)
+generator = FinancialAnswerGenerator(model_name=settings.llm_model)
+redactor  = PIIRedactor()
+
+
+# ── Lifespan: persist index on shutdown ───────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown lifecycle.
+
+    On shutdown the FAISS index is saved to ``settings.faiss_persist_dir`` so
+    ingested documents survive server restarts.
+    """
+    logger.info(
+        "FinSight RAG starting — %d chunks pre-loaded from disk",
+        vector_store.count(),
+    )
+    yield
+    # ── shutdown ──────────────────────────────────────────────────────────
+    if vector_store.count() > 0:
+        try:
+            vector_store.save(settings.faiss_persist_dir)
+            logger.info(
+                "Index persisted to %s (%d chunks)",
+                settings.faiss_persist_dir,
+                vector_store.count(),
+            )
+        except Exception as exc:
+            logger.error("Failed to persist index on shutdown: %s", exc)
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title=settings.app_name,
-    description="Production-Grade Document Intelligence for Financial Workflows (JPMC, Goldman, UBS)",
+    description=(
+        "Production-Grade Document Intelligence for Financial Workflows "
+        "(JPMC, Goldman, UBS)"
+    ),
     version=settings.app_version,
     debug=settings.debug,
+    lifespan=lifespan,
 )
 
-# CORS middleware — origins controlled via settings / .env
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -41,31 +102,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pipeline instances (singleton lifecycle) — parameters from settings
-extractor = PDFExtractor()
-chunker = SemanticChunker(
-    max_tokens=settings.chunk_max_tokens,
-    overlap_tokens=settings.chunk_overlap_tokens,
-)
-embedder = Embedder(
-    model_name=settings.embedding_model,
-    dimension=settings.embedding_dim,
-)
-vector_store = VectorStore(dimension=embedder.dimension)
-retriever = HybridRetriever(
-    vector_store,
-    embedder,
-    bm25_weight=settings.bm25_weight,
-    dense_weight=settings.dense_weight,
-)
-generator = FinancialAnswerGenerator(model_name=settings.llm_model)
+# ── Rate limiting (slowapi) ────────────────────────────────────────────────────
+if settings.rate_limit_per_minute > 0:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
 
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=[f"{settings.rate_limit_per_minute}/minute"],
+    )
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+# ── API Key auth middleware ───────────────────────────────────────────────────
+app.add_middleware(APIKeyMiddleware)
+
+
+# ── System ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["System"])
 def root():
     """Welcome endpoint with interactive documentation links and API summary."""
     return {
         "service": settings.app_name,
+        "version": settings.app_version,
         "status": "online",
         "documentation": "/docs",
         "openapi_schema": "/openapi.json",
@@ -74,8 +137,11 @@ def root():
             "ingest_file": "POST /ingest/file",
             "ingest_text": "POST /ingest/text",
             "query": "POST /query",
-            "documents": "GET /documents"
-        }
+            "query_stream": "POST /query/stream",
+            "documents": "GET /documents",
+            "delete_document": "DELETE /documents/{doc_id}",
+            "reset_index": "DELETE /documents",
+        },
     }
 
 
@@ -85,33 +151,35 @@ def health_check():
     return {
         "status": "healthy",
         "indexed_chunks": vector_store.count(),
+        "unique_documents": len(vector_store.get_doc_ids()),
         "vector_dimension": embedder.dimension,
-        "dense_backend": "sentence-transformers" if not embedder.is_fallback else "hash-projection",
+        "vector_backend": settings.vector_store_backend,
+        "dense_encoder": (
+            "sentence-transformers" if not embedder.is_fallback else "hash-projection"
+        ),
+        "persist_dir": settings.faiss_persist_dir,
     }
 
 
-redactor = PIIRedactor()
-
+# ── Ingestion ─────────────────────────────────────────────────────────────────
 
 @app.post("/ingest/text", tags=["Ingestion"])
 def ingest_text(payload: IngestTextRequest):
-    """Ingests raw text or markdown document directly into index with optional PII redaction."""
+    """Ingests raw text or markdown document into the index with optional PII redaction."""
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Document content cannot be empty")
 
     content_to_index = payload.content
-    redacted_types = []
+    redacted_types: List[str] = []
     if payload.redact_pii:
         content_to_index, redacted_types = redactor.redact(payload.content)
 
-    from ingestion.pdf_extractor import ExtractedPage
     page = ExtractedPage(page_number=payload.page_number, text=content_to_index)
-    doc_id = f"doc_{abs(hash(payload.filename + content_to_index)) % 1000000:06d}"
+    doc_id = f"doc_{abs(hash(payload.filename + content_to_index)) % 1_000_000:06d}"
     chunks = chunker.chunk_document([page], doc_id=doc_id, filename=payload.filename)
 
     if chunks:
-        texts = [c.content for c in chunks]
-        embeddings = embedder.embed_texts(texts)
+        embeddings = embedder.embed_texts([c.content for c in chunks])
         vector_store.add_chunks(chunks, embeddings)
         retriever.index_updated()
 
@@ -124,17 +192,15 @@ def ingest_text(payload: IngestTextRequest):
     }
 
 
-
-
 @app.post("/ingest/file", tags=["Ingestion"])
 async def ingest_file(file: UploadFile = File(...)):
-    """Ingests and chunks an uploaded document (PDF or TXT)."""
+    """Ingests and chunks an uploaded document (PDF, TXT, MD, DOCX)."""
     allowed_exts = [".pdf", ".txt", ".md", ".docx"]
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in allowed_exts:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format '{file_ext}'. Supported formats: {allowed_exts}"
+            detail=f"Unsupported format '{file_ext}'. Supported: {allowed_exts}",
         )
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
@@ -143,16 +209,15 @@ async def ingest_file(file: UploadFile = File(...)):
 
     try:
         if file_ext == ".pdf":
-            pages = extractor.extract(tmp_path)
+            pages  = extractor.extract(tmp_path)
             doc_id = extractor.compute_doc_id(tmp_path)
         else:
-            pages = extractor.extract_text_file(tmp_path)
-            doc_id = f"doc_{abs(hash(file.filename)) % 1000000:06d}"
+            pages  = extractor.extract_text_file(tmp_path)
+            doc_id = f"doc_{abs(hash(file.filename)) % 1_000_000:06d}"
 
         chunks = chunker.chunk_document(pages, doc_id=doc_id, filename=file.filename)
         if chunks:
-            texts = [c.content for c in chunks]
-            embeddings = embedder.embed_texts(texts)
+            embeddings = embedder.embed_texts([c.content for c in chunks])
             vector_store.add_chunks(chunks, embeddings)
             retriever.index_updated()
 
@@ -168,14 +233,13 @@ async def ingest_file(file: UploadFile = File(...)):
             os.remove(tmp_path)
 
 
-from fastapi.responses import StreamingResponse
-import asyncio
-
+# ── Retrieval & Generation ────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["Retrieval & Generation"])
 def query_pipeline(req: QueryRequest):
-    """Executes the complete FinSight RAG pipeline:
-    Query -> Hybrid Retrieval -> Guardrail Verification -> Structured Answer
+    """Executes the full FinSight RAG pipeline:
+    Query Rewriting → Hybrid Retrieval (BM25 + Dense RRF) →
+    ColBERT Reranking → Citation Guardrail → Structured Answer
     """
     if vector_store.count() == 0:
         return QueryResponse(
@@ -185,25 +249,23 @@ def query_pipeline(req: QueryRequest):
             escalate=True,
         )
 
-    # 1. Hybrid search (BM25 + Dense with RRF + ColBERT late-interaction reranking)
-    results = retriever.search(req.query, top_k=req.top_k, enable_reranking=req.enable_reranking)
+    results = retriever.search(
+        req.query, top_k=req.top_k, enable_reranking=req.enable_reranking
+    )
     context_chunks = [r.chunk for r in results]
-
-    # 2. Generation & Guardrail
-    response = generator.generate(req.query, context_chunks)
-    return response
+    return generator.generate(req.query, context_chunks)
 
 
 @app.post("/query/stream", tags=["Retrieval & Generation"])
 async def query_pipeline_stream(req: QueryRequest):
-    """Streams structured response tokens using FastAPI StreamingResponse."""
+    """Streams the answer token-by-token via Server-Sent Events (SSE)."""
     async def token_generator():
         res = query_pipeline(req)
-        # Yield metadata event
-        yield f"event: metadata\ndata: {res.model_dump_json(include={'sources', 'confidence', 'escalate'})}\n\n"
+        yield (
+            f"event: metadata\n"
+            f"data: {res.model_dump_json(include={'sources','confidence','escalate'})}\n\n"
+        )
         await asyncio.sleep(0.01)
-
-        # Stream answer tokens
         words = res.answer.split(" ")
         for i, word in enumerate(words):
             chunk = word if i == 0 else f" {word}"
@@ -214,19 +276,52 @@ async def query_pipeline_stream(req: QueryRequest):
     return StreamingResponse(token_generator(), media_type="text/event-stream")
 
 
+# ── Index management ──────────────────────────────────────────────────────────
 
-@app.get("/documents", tags=["System"])
+@app.get("/documents", tags=["Index Management"])
 def list_documents():
-    """Lists summary of all currently indexed chunks."""
+    """Lists a summary of all currently indexed chunks (max 50 shown)."""
     return {
         "total_chunks": vector_store.count(),
+        "unique_documents": len(vector_store.get_doc_ids()),
         "chunks": [
             {
                 "chunk_id": c.chunk_id,
+                "doc_id": c.metadata.doc_id,
                 "filename": c.metadata.filename,
                 "page": c.metadata.page_number,
-                "preview": c.content[:100] + "..."
+                "preview": c.content[:100] + "...",
             }
             for c in vector_store.chunks[:50]
-        ]
+        ],
+    }
+
+
+@app.delete("/documents/{doc_id}", tags=["Index Management"])
+def delete_document(doc_id: str):
+    """Removes all indexed chunks for the given doc_id."""
+    removed = vector_store.delete_by_doc_id(doc_id)
+    if removed == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No chunks found for doc_id='{doc_id}'",
+        )
+    retriever.index_updated()
+    return {
+        "doc_id": doc_id,
+        "chunks_removed": removed,
+        "total_store_chunks": vector_store.count(),
+    }
+
+
+@app.delete("/documents", tags=["Index Management"])
+def reset_index():
+    """Wipes the entire vector index. Irreversible."""
+    count_before = vector_store.count()
+    vector_store.reset()
+    retriever.index_updated()
+    return {
+        "message": "Index reset successfully",
+        "chunks_removed": count_before,
+        "total_store_chunks": 0,
     }

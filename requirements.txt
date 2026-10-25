@@ -4,6 +4,7 @@ uvicorn[standard]>=0.28.0
 pydantic>=2.6.0
 pydantic-settings>=2.3.0
 python-multipart>=0.0.9
+slowapi>=0.1.9
 
 # Document Processing
 pdfplumber>=0.10.3
