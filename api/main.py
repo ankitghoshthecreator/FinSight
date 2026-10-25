@@ -31,6 +31,7 @@ from retrieval.embedder import Embedder
 from retrieval.hybrid_search import HybridRetriever
 from retrieval.vector_store import VectorStore
 from generation.generator import FinancialAnswerGenerator
+from generation.session import session_manager
 
 logger = logging.getLogger(__name__)
 
@@ -350,13 +351,38 @@ def query_pipeline(req: QueryRequest):
             escalate=True,
         )
 
+    session = session_manager.get_or_create(req.session_id) if req.session_id else None
+    if session:
+        session_manager.add_turn(session.session_id, "user", req.query)
+
     results = retriever.search(
         req.query, top_k=req.top_k, enable_reranking=req.enable_reranking
     )
     context_chunks = [r.chunk for r in results]
     response = generator.generate(req.query, context_chunks)
     metrics_collector.record_query(latency_ms=15.0, escalated=response.escalate)
+
+    if session:
+        session_manager.add_turn(session.session_id, "assistant", response.answer)
+        response.session_id = session.session_id
+
     return response
+
+
+@app.get("/sessions/{session_id}", tags=["Retrieval & Generation"])
+def get_session_history(session_id: str):
+    """Retrieves conversation turn history for a multi-turn analysis session."""
+    session = session_manager.get_or_create(session_id)
+    return session
+
+
+@app.delete("/sessions/{session_id}", tags=["Retrieval & Generation"])
+def delete_session(session_id: str):
+    """Deletes conversation memory for a session."""
+    deleted = session_manager.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return {"message": f"Session '{session_id}' deleted successfully"}
 
 
 @app.post("/query/stream", tags=["Retrieval & Generation"])

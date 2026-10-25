@@ -53,7 +53,7 @@ Financial analysts spend hours manually searching PDFs and policy documents for 
 | LLM | Qwen2.5-1.5B-Instruct (local), Llama 3 (API) |
 | Frameworks | LangChain, Pydantic v2, FastAPI |
 | Evaluation | RAGAS (faithfulness, answer relevancy, context recall) |
-| Infra | Docker, Docker Compose, GitHub Actions CI/CD, pytest (57 unit + integration tests) |
+| Infra | Docker, Docker Compose, GitHub Actions CI/CD, pytest (66 unit + integration tests) |
 
 ---
 
@@ -106,7 +106,7 @@ The **CIRCLE** curriculum-trained LLM (see [CIRCLE repo](https://github.com/anki
 
 - Built a **production-grade RAG pipeline** ingesting financial PDFs with **PII redaction** (SSN/PAN/email), **semantic chunking** (512 tokens, 64 overlap), **hybrid BM25 + dense retrieval (RRF)**, **ColBERT late-interaction MaxSim reranking**, and **financial acronym query expansion** — improving **Context Recall@5 64% → 91%** and reducing **hallucination rate ~18% → ~3%**.
 - Enforced **Pydantic JSON-schema structured outputs** with **citation guardrails** that verify every factual claim against retrieved chunks, returning `"insufficient context"` rather than hallucinating — targeting regulated financial environments (JPMC, Goldman, MUFG patterns).
-- Built **ColBERT late-interaction reranker** implementing `MaxSim(Q,D) = (1/|Q|)·Σᵢ maxⱼ(Eq,i·Ed,j)` with financial query rewriter expanding 23 regulatory acronyms (SLR, CET1, CCAR, DFAST, ISDA…); deployed **FastAPI streaming SSE endpoint** (`/query/stream`); integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** backbone; validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**) and **57 automated tests**.
+- Built **ColBERT late-interaction reranker** implementing `MaxSim(Q,D) = (1/|Q|)·Σᵢ maxⱼ(Eq,i·Ed,j)` with financial query rewriter expanding 23 regulatory acronyms (SLR, CET1, CCAR, DFAST, ISDA…); deployed **FastAPI streaming SSE endpoint** (`/query/stream`); integrated **CIRCLE's QLoRA-fine-tuned Qwen2.5** backbone; validated end-to-end with **RAGAS** (faithfulness **0.61 → 0.87**) and **66 automated tests**.
 - Productionized with **pydantic-settings centralized config**, **persistent FAISS vector storage**, **API key auth + slowapi rate limiting**, **RFC 7807 problem details**, **Prometheus observability metrics**, and an **interactive Streamlit intelligence dashboard**, packaged via **Docker Compose** and validated with **GitHub Actions CI/CD**.
 
 ---

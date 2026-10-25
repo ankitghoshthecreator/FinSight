@@ -55,6 +55,7 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50, description="Number of context chunks to retrieve")
     confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="Minimum confidence score")
     enable_reranking: bool = Field(default=True, description="Whether to apply score fusion / reranking")
+    session_id: Optional[str] = Field(default=None, description="Optional conversation session ID for multi-turn QA")
 
 
 class QueryResponse(BaseModel):
@@ -63,3 +64,4 @@ class QueryResponse(BaseModel):
     sources: List[Citation] = Field(default_factory=list, description="List of source citations")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score")
     escalate: bool = Field(..., description="Flag true if confidence is low, context is insufficient, or conflict detected")
+    session_id: Optional[str] = Field(default=None, description="Session ID tracking multi-turn conversation")
