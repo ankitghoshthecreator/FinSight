@@ -28,11 +28,13 @@ class HybridRetriever:
         dense_weight: float = 0.5,
         reranker: Optional[ColBERTReranker] = None,
         query_rewriter: Optional[FinancialQueryRewriter] = None,
+        colbert_fusion_weight: float = 0.65,
     ):
         self.vector_store = vector_store
         self.embedder = embedder
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
+        self.colbert_fusion_weight = min(1.0, max(0.0, colbert_fusion_weight))
         self.reranker = reranker if reranker is not None else ColBERTReranker()
         self.query_rewriter = query_rewriter if query_rewriter is not None else FinancialQueryRewriter()
         self._bm25_corpus: List[List[str]] = []
@@ -193,7 +195,12 @@ class HybridRetriever:
         # 4. Optional ColBERT Late-Interaction Reranking
         if enable_reranking and self.reranker:
             candidates_to_rerank = fused_list[:top_k * 2]
-            reranked = self.reranker.rerank(query, candidates_to_rerank, top_k=top_k)
+            reranked = self.reranker.rerank(
+                query,
+                candidates_to_rerank,
+                top_k=top_k,
+                fusion_weight=self.colbert_fusion_weight,
+            )
             return reranked
 
         return fused_list[:top_k]

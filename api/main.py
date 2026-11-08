@@ -55,6 +55,7 @@ retriever = HybridRetriever(
     embedder,
     bm25_weight=settings.bm25_weight,
     dense_weight=settings.dense_weight,
+    colbert_fusion_weight=settings.colbert_fusion_weight,
 )
 generator = FinancialAnswerGenerator(model_name=settings.llm_model)
 redactor  = PIIRedactor()

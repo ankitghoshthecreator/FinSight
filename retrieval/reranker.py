@@ -1,59 +1,58 @@
-"""ColBERT late-interaction and Cross-Encoder reranking for financial documents.
-Target pattern: JPMC / Goldman Sachs / MUFG late-interaction precision retrieval.
+"""ColBERT late-interaction reranking for financial documents.
 
-Implements ColBERT MaxSim operator:
-    Score(Q, D) = sum_{i in Q} max_{j in D} (E_{q,i} · E_{d,j})
-providing token-level fine-grained soft-alignment between query terms and document passages.
+When enabled, this uses the official ``colbert-ai`` checkpoint implementation.
+The deterministic token encoder remains available as a lightweight fallback for
+offline development and installations without the optional model dependencies.
 """
 
-import math
+import hashlib
+import logging
+import os
 import re
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional
+
 import numpy as np
 
-from ingestion.models import DocumentChunk, SearchResult
+from config.settings import settings
+from ingestion.models import SearchResult
+
+logger = logging.getLogger(__name__)
 
 
 class ColBERTReranker:
-    """Late-interaction reranker implementing the ColBERT MaxSim scoring algorithm.
-    
-    Dense bi-encoders pool entire documents into a single vector, losing exact
-    positional alignments for complex financial metrics (e.g. 'CET1 capital ratio vs SLR').
-    ColBERT late interaction retains token embeddings and computes token-level maximum similarity,
-    combining the computational efficiency of vector indexing with cross-encoder precision.
-    """
+    """Rerank a hybrid-search candidate set with ColBERT MaxSim."""
 
     def __init__(
         self,
-        model_name: str = "colbert-ir/colbertv2.0",
+        model_name: Optional[str] = None,
         embedding_dim: int = 128,
         use_fallback: Optional[bool] = None,
     ):
-        self.model_name = model_name
+        self.model_name = model_name or settings.colbert_model
         self.embedding_dim = embedding_dim
-        self._model = None
-        self._tokenizer = None
+        self._checkpoint = None
         self._is_fallback = True
-
-        if use_fallback is False:
-            self._try_load_model()
-        elif use_fallback is None:
+        enabled = settings.colbert_enabled if use_fallback is None else not use_fallback
+        if enabled:
             self._try_load_model()
 
-    def _try_load_model(self):
-        """Attempts to load a transformer-based ColBERT or CrossEncoder model."""
-        import os
-        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("FINSIGHT_TEST_MODE", "1") == "1":
-            self._is_fallback = True
-            return
-
+    def _try_load_model(self) -> None:
+        """Load the official ColBERT checkpoint (downloads if not cached)."""
         try:
-            from transformers import AutoTokenizer, AutoModel
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
-            self._model = AutoModel.from_pretrained(self.model_name, local_files_only=True)
-            self._model.eval()
+            from colbert.infra import ColBERTConfig, Run, RunConfig
+            from colbert.modeling.checkpoint import Checkpoint
+
+            # Checkpoint provides query/document token embeddings and the same
+            # MaxSim scoring used by ColBERT search, without building a second index.
+            with Run().context(RunConfig(nranks=1, experiment="finsight-reranker")):
+                self._checkpoint = Checkpoint(
+                    self.model_name,
+                    colbert_config=ColBERTConfig(root=os.environ.get("COLBERT_ROOT", ".colbert")),
+                )
             self._is_fallback = False
-        except Exception:
+        except Exception as exc:
+            logger.warning("Could not load ColBERT model %s; using local fallback: %s", self.model_name, exc)
+            self._checkpoint = None
             self._is_fallback = True
 
     @property
@@ -61,61 +60,51 @@ class ColBERTReranker:
         return self._is_fallback
 
     def _tokenize(self, text: str) -> List[str]:
-        """Splits text into meaningful token sequence preserving financial symbols."""
-        tokens = re.findall(r'[a-zA-Z0-9_\-\.\$\%]+', text.lower())
+        tokens = re.findall(r"[a-zA-Z0-9_\-.$%]+", text.lower())
         return tokens if tokens else [text.lower().strip()]
 
     def _token_embedding(self, token: str) -> np.ndarray:
-        """Deterministic pseudo-orthogonal embedding projection for token-level MaxSim."""
+        """Stable pseudo-embedding used only by the offline fallback."""
         vec = np.zeros(self.embedding_dim, dtype=np.float32)
-        h = hash(token)
-        # Use prime offsets to populate multiple dimensions per token
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
         for i in range(4):
-            idx = abs(hash((token, i, 7919))) % self.embedding_dim
-            sign = 1.0 if (hash((token, i, 104729)) % 2 == 0) else -1.0
-            vec[idx] += sign
-
-        # Add character n-gram fingerprints to capture morphology & substrings (e.g. "ratio" in "leverage-ratio")
-        for k in range(len(token) - 2):
-            gram = token[k:k + 3]
-            idx = abs(hash(gram)) % self.embedding_dim
-            vec[idx] += 0.5
-
+            idx = int.from_bytes(digest[i * 4 : i * 4 + 4], "little") % self.embedding_dim
+            vec[idx] += 1.0 if digest[12 + i] % 2 == 0 else -1.0
+        for k in range(max(0, len(token) - 2)):
+            gram = hashlib.blake2b(token[k : k + 3].encode("utf-8"), digest_size=4).digest()
+            vec[int.from_bytes(gram, "little") % self.embedding_dim] += 0.5
         norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
+        return vec / norm if norm else vec
 
     def _encode_sequence(self, tokens: List[str]) -> np.ndarray:
-        """Encodes a sequence of tokens into an [L, dim] normalized embedding matrix."""
         if not tokens:
             return np.zeros((1, self.embedding_dim), dtype=np.float32)
-        matrix = np.stack([self._token_embedding(t) for t in tokens], axis=0)
-        return matrix
+        return np.stack([self._token_embedding(token) for token in tokens])
 
     def compute_maxsim(self, query_tokens: List[str], doc_tokens: List[str]) -> float:
-        """Calculates ColBERT MaxSim score:
-        MaxSim(Q, D) = (1 / |Q|) * sum_{i in Q} max_{j in D} (E_{q,i} · E_{d,j})
-        """
+        """Compute mean token-level maximum cosine similarity (fallback only)."""
         if not query_tokens or not doc_tokens:
             return 0.0
-
-        q_mat = self._encode_sequence(query_tokens)  # [Q_len, dim]
-        d_mat = self._encode_sequence(doc_tokens)    # [D_len, dim]
-
-        # Cosine similarity matrix between all query and doc tokens: [Q_len, D_len]
-        sim_matrix = np.dot(q_mat, d_mat.T)
-
-        # For each query token, find the maximum similarity across all document tokens
-        max_sim_per_query_token = np.max(sim_matrix, axis=1)  # [Q_len]
-
-        # Normalized average MaxSim score bounded roughly in [0, 1]
-        score = float(np.mean(max_sim_per_query_token))
-        return max(0.0, min(1.0, score))
+        similarities = self._encode_sequence(query_tokens) @ self._encode_sequence(doc_tokens).T
+        return float(np.clip(np.max(similarities, axis=1).mean(), 0.0, 1.0))
 
     def score(self, query: str, document_text: str) -> float:
-        """Computes fine-grained late-interaction relevance score between query and text."""
-        q_tokens = self._tokenize(query)
-        d_tokens = self._tokenize(document_text)
-        return self.compute_maxsim(q_tokens, d_tokens)
+        if self._checkpoint is not None:
+            return self._model_scores(query, [document_text])[0]
+        return self.compute_maxsim(self._tokenize(query), self._tokenize(document_text))
+
+    def _model_scores(self, query: str, documents: List[str]) -> List[float]:
+        """Return official ColBERT MaxSim scores for a query and documents."""
+        from colbert.modeling.colbert import colbert_score
+
+        q = self._checkpoint.queryFromText([query], bsize=1)
+        d, d_mask = self._checkpoint.docFromText(
+            documents, bsize=len(documents), keep_dims="return_mask"
+        )
+        # The upstream helper applies ColBERT's document-token mask and supports
+        # broadcasting one query embedding over the whole candidate batch.
+        scores = colbert_score(q, d, d_mask, config=self._checkpoint.colbert_config)
+        return [float(value) for value in scores.detach().cpu().reshape(-1).tolist()]
 
     def rerank(
         self,
@@ -124,40 +113,24 @@ class ColBERTReranker:
         top_k: Optional[int] = None,
         fusion_weight: float = 0.65,
     ) -> List[SearchResult]:
-        """Reranks candidates using ColBERT late-interaction scores fused with initial hybrid score.
-        
-        Args:
-            query: User's search query.
-            candidates: Initial candidate search results from vector + BM25 retrieval.
-            top_k: Number of reranked candidates to return. If None, returns all.
-            fusion_weight: Weight given to ColBERT late interaction score vs initial hybrid score (0..1).
-        
-        Returns:
-            Reranked list of SearchResults with updated scores.
-        """
         if not candidates:
             return []
+        fusion_weight = min(1.0, max(0.0, float(fusion_weight)))
+        if self._checkpoint is not None:
+            raw_scores = self._model_scores(query, [item.chunk.content for item in candidates])
+            low, high = min(raw_scores), max(raw_scores)
+            late_scores = [((score - low) / (high - low)) if high > low else 0.5 for score in raw_scores]
+        else:
+            late_scores = [self.compute_maxsim(self._tokenize(query), self._tokenize(item.chunk.content)) for item in candidates]
 
-        q_tokens = self._tokenize(query)
-        reranked: List[SearchResult] = []
-
-        for candidate in candidates:
-            d_tokens = self._tokenize(candidate.chunk.content)
-            colbert_score = self.compute_maxsim(q_tokens, d_tokens)
-
-            # Combined score: blends initial candidate score with late-interaction fine alignment
-            fused_score = (fusion_weight * colbert_score) + ((1.0 - fusion_weight) * candidate.score)
-
-            reranked.append(
-                SearchResult(
-                    chunk=candidate.chunk,
-                    score=round(float(fused_score), 4),
-                    dense_score=candidate.dense_score,
-                    bm25_score=candidate.bm25_score,
-                )
-            )
-
-        reranked.sort(key=lambda x: x.score, reverse=True)
-        if top_k is not None:
-            return reranked[:top_k]
-        return reranked
+        reranked = []
+        for candidate, late_score in zip(candidates, late_scores):
+            fused_score = fusion_weight * late_score + (1.0 - fusion_weight) * candidate.score
+            reranked.append(SearchResult(
+                chunk=candidate.chunk,
+                score=round(float(fused_score), 4),
+                dense_score=candidate.dense_score,
+                bm25_score=candidate.bm25_score,
+            ))
+        reranked.sort(key=lambda item: item.score, reverse=True)
+        return reranked[:top_k] if top_k is not None else reranked

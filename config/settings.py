@@ -72,6 +72,11 @@ class Settings(BaseSettings):
         default=0.65,
         description="Weight given to ColBERT score vs initial hybrid score.",
     )
+    colbert_enabled: bool = Field(
+        default=False,
+        description="Load the full ColBERT checkpoint; requires colbert-ai and model weights.",
+    )
+    colbert_model: str = Field(default="colbert-ir/colbertv2.0")
 
     # ── Vector Store ───────────────────────────────────────────────────────
     vector_store_backend: str = Field(

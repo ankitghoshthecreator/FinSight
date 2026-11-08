@@ -172,6 +172,6 @@ finsight-rag/
 
 ## What's Next
 
-- ColBERT production upgrade to full transformer model (`colbert-ir/colbertv2.0`) when GPU is available
+- Full ColBERTv2 reranking is available through the official `colbert-ai` checkpoint implementation. Set `COLBERT_ENABLED=true` to load `COLBERT_MODEL` (GPU is used when available); the deterministic fallback remains available for offline development.
 - Qdrant server-mode vector store for persistent multi-tenant deployments
 - Async document ingestion queue (Celery / background tasks) for large-scale batch processing
