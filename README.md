@@ -173,5 +173,6 @@ finsight-rag/
 ## What's Next
 
 - Full ColBERTv2 reranking is available through the official `colbert-ai` checkpoint implementation. Set `COLBERT_ENABLED=true` to load `COLBERT_MODEL` (GPU is used when available); the deterministic fallback remains available for offline development.
-- Qdrant server-mode vector store for persistent multi-tenant deployments
+- Qdrant server mode is implemented with persistent collections, vector search, and document deletion. Set `VECTOR_STORE_BACKEND=qdrant`, `QDRANT_URL`, and `QDRANT_COLLECTION`; Docker Compose uses Qdrant by default. FAISS remains the default for local runs.
+- Celery/background-task ingestion queue for large-scale batch processing
 - Async document ingestion queue (Celery / background tasks) for large-scale batch processing

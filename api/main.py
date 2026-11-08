@@ -49,6 +49,10 @@ embedder = Embedder(
 vector_store = VectorStore(
     dimension=embedder.dimension,
     persist_dir=settings.faiss_persist_dir,   # auto-loads on init if dir exists
+    backend=settings.vector_store_backend,
+    qdrant_url=settings.qdrant_url,
+    qdrant_collection=settings.qdrant_collection,
+    qdrant_api_key=settings.qdrant_api_key or None,
 )
 retriever = HybridRetriever(
     vector_store,
@@ -76,7 +80,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     # ── shutdown ──────────────────────────────────────────────────────────
-    if vector_store.count() > 0:
+    if vector_store.backend == "faiss" and vector_store.count() > 0:
         try:
             vector_store.save(settings.faiss_persist_dir)
             logger.info(

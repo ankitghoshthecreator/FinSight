@@ -4,7 +4,7 @@ services:
   finsight-api:
     build:
       context: .
-      file: docker/Dockerfile
+      dockerfile: docker/Dockerfile
     container_name: finsight-rag-api
     restart: unless-stopped
     ports:
@@ -14,11 +14,13 @@ services:
       - APP_VERSION=2.0.0
       - API_HOST=0.0.0.0
       - API_PORT=8000
-      - VECTOR_STORE_BACKEND=faiss
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-qdrant}
       - FAISS_PERSIST_DIR=/app/data/faiss_index
       - RATE_LIMIT_PER_MINUTE=60
       - FINSIGHT_TEST_MODE=true
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-finsight_chunks}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
     volumes:
       - finsight-faiss-data:/app/data/faiss_index
     healthcheck:

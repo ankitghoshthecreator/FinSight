@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     )
     qdrant_url: str = Field(default="http://localhost:6333")
     qdrant_collection: str = Field(default="finsight_chunks")
+    qdrant_api_key: str = Field(default="", description="Optional Qdrant API key for secured deployments.")
     faiss_persist_dir: str = Field(
         default="./data/faiss_index",
         description="Directory to save/load FAISS index across restarts.",

@@ -19,6 +19,7 @@ tiktoken>=0.6.0
 faiss-cpu>=1.8.0
 rank-bm25>=0.2.2
 colbert-ai>=0.2.21
+qdrant-client>=1.10.1
 
 # Testing & Quality
 pytest>=8.0.0
